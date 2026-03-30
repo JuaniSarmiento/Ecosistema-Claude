@@ -1,0 +1,22 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "ecosistema-claude",
+  "description": "Gentleman Native ecosystem — SDD workflow, specialized agents, persistent SQLite memory, security hooks, and coding skills for Claude Code",
+  "owner": {
+    "name": "Juani Sarmiento",
+    "email": "noreply@github.com"
+  },
+  "plugins": [
+    {
+      "name": "claude-gentleman-native",
+      "description": "Full development ecosystem with 8 specialized agents, SDD methodology, persistent SQLite memory with FTS5, security hooks, and 15 coding skills.",
+      "version": "1.0.0",
+      "author": {
+        "name": "Juani Sarmiento"
+      },
+      "source": ".",
+      "category": "development",
+      "homepage": "https://github.com/JuaniSarmiento/Ecosistema-Claude"
+    }
+  ]
+}
