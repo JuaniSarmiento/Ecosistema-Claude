@@ -14,7 +14,11 @@
       "author": {
         "name": "Juani Sarmiento"
       },
-      "source": ".",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/JuaniSarmiento/Ecosistema-Claude.git",
+        "path": "."
+      },
       "category": "development",
       "homepage": "https://github.com/JuaniSarmiento/Ecosistema-Claude"
     }
