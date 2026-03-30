@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
 Gentleman Memory MCP Server — SQLite+FTS5 persistent memory for Claude Code.
+Drop-in replacement for Engram. Exposes the same tool names and parameters.
 
-JSON-RPC 2.0 over stdio. Provides 7 tools: mem_save, mem_search, mem_get,
-mem_update, mem_context, mem_session_start, mem_session_summary.
+JSON-RPC 2.0 over stdio. Provides 12 tools: mem_save, mem_search,
+mem_get_observation, mem_update, mem_context, mem_session_start,
+mem_session_end, mem_session_summary, mem_save_prompt,
+mem_capture_passive, mem_suggest_topic_key.
 
 Database: ~/.claude/gentleman-memory/memory.db (WAL mode, FTS5 full-text search).
 Auto-migrates from legacy .claude/memory/*.md files on first run.
@@ -12,9 +15,9 @@ Python 3 stdlib only — no external dependencies.
 
 import json
 import os
+import re
 import sqlite3
 import sys
-import uuid
 from datetime import datetime, timezone
 from glob import glob
 from pathlib import Path
@@ -27,6 +30,14 @@ DB_DIR = Path.home() / ".claude" / "gentleman-memory"
 DB_PATH = DB_DIR / "memory.db"
 PROJECT_DIR = os.environ.get("CLAUDE_PROJECT_DIR", os.getcwd())
 LEGACY_MEMORY_DIR = Path(PROJECT_DIR) / ".claude" / "memory"
+
+VALID_TYPES = frozenset({
+    "tool_use", "file_change", "command", "file_read", "search", "manual",
+    "decision", "architecture", "bugfix", "pattern", "config", "discovery",
+    "learning", "preference", "convention", "session_summary", "prompt",
+})
+
+VALID_SCOPES = frozenset({"project", "personal"})
 
 # ---------------------------------------------------------------------------
 # Database setup
@@ -57,17 +68,17 @@ def _init_db() -> sqlite3.Connection:
 
     HAS_FTS5 = _check_fts5(conn)
 
-    # Core tables
+    # Check if observations table exists and has the old CHECK constraint
+    _migrate_check_constraint(conn)
+
+    # Core tables — no CHECK constraint on type (validated in Python)
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS observations (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             title       TEXT NOT NULL,
             content     TEXT NOT NULL,
-            type        TEXT CHECK(type IN (
-                'bugfix','decision','architecture','discovery',
-                'pattern','config','preference','convention','session_summary'
-            )),
-            scope       TEXT DEFAULT 'project' CHECK(scope IN ('project','personal')),
+            type        TEXT,
+            scope       TEXT DEFAULT 'project',
             topic_key   TEXT,
             project     TEXT,
             session_id  TEXT,
@@ -78,12 +89,19 @@ def _init_db() -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS sessions (
             id          TEXT PRIMARY KEY,
             project     TEXT,
+            directory   TEXT,
             goal        TEXT,
             summary     TEXT,
             started_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
             ended_at    DATETIME
         );
     """)
+
+    # Add directory column to sessions if missing (migration)
+    try:
+        conn.execute("ALTER TABLE sessions ADD COLUMN directory TEXT")
+    except sqlite3.OperationalError:
+        pass  # already exists
 
     # Unique partial index for topic_key upsert
     try:
@@ -141,6 +159,48 @@ def _init_db() -> sqlite3.Connection:
         _log("FTS5 not available — falling back to LIKE-based search")
 
     return conn
+
+
+def _migrate_check_constraint(conn: sqlite3.Connection) -> None:
+    """If the old observations table has a CHECK constraint on type, recreate without it."""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='observations'"
+    ).fetchone()
+    if row is None:
+        return  # table doesn't exist yet, will be created fresh
+
+    create_sql = row[0] or ""
+    if "CHECK" not in create_sql.upper():
+        return  # no CHECK constraint, nothing to migrate
+
+    _log("Migrating observations table to remove CHECK constraint on type...")
+    conn.executescript("""
+        ALTER TABLE observations RENAME TO _observations_old;
+
+        CREATE TABLE observations (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            title       TEXT NOT NULL,
+            content     TEXT NOT NULL,
+            type        TEXT,
+            scope       TEXT DEFAULT 'project',
+            topic_key   TEXT,
+            project     TEXT,
+            session_id  TEXT,
+            created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+
+        INSERT INTO observations SELECT * FROM _observations_old;
+        DROP TABLE _observations_old;
+    """)
+
+    # Rebuild FTS index if it exists
+    try:
+        conn.execute("INSERT INTO observations_fts(observations_fts) VALUES('rebuild')")
+    except sqlite3.OperationalError:
+        pass
+
+    _log("Migration complete — CHECK constraint removed.")
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +279,23 @@ def _row_to_dict(row: sqlite3.Row) -> dict:
     return dict(row)
 
 
+def _validate_type(obs_type: str | None) -> str | None:
+    """Validate observation type. Returns the type or None if invalid/empty."""
+    if obs_type is None or obs_type == "":
+        return None
+    if obs_type not in VALID_TYPES:
+        _log(f"Warning: unrecognized type '{obs_type}', allowing anyway")
+    return obs_type
+
+
+def _normalize_topic_key(raw: str) -> str:
+    """Lowercase, replace spaces with hyphens, strip special chars."""
+    key = raw.lower().strip()
+    key = re.sub(r"[^a-z0-9/_-]", "", key.replace(" ", "-"))
+    key = re.sub(r"-+", "-", key).strip("-")
+    return key
+
+
 # ---------------------------------------------------------------------------
 # Tool implementations
 # ---------------------------------------------------------------------------
@@ -226,7 +303,7 @@ def _row_to_dict(row: sqlite3.Row) -> dict:
 def tool_mem_save(conn: sqlite3.Connection, args: dict) -> dict:
     title = args.get("title", "").strip()
     content = args.get("content", "").strip()
-    obs_type = args.get("type")
+    obs_type = _validate_type(args.get("type"))
     scope = args.get("scope", "project")
     topic_key = args.get("topic_key")
     project = args.get("project")
@@ -234,6 +311,9 @@ def tool_mem_save(conn: sqlite3.Connection, args: dict) -> dict:
 
     if not title or not content:
         return {"error": "title and content are required"}
+
+    if topic_key:
+        topic_key = _normalize_topic_key(topic_key)
 
     now = _now()
 
@@ -267,7 +347,7 @@ def tool_mem_search(conn: sqlite3.Connection, args: dict) -> dict:
     project = args.get("project")
     obs_type = args.get("type")
     scope = args.get("scope")
-    limit = int(args.get("limit", 10))
+    limit = min(int(args.get("limit", 10)), 20)
 
     if not query:
         return {"error": "query is required"}
@@ -343,7 +423,7 @@ def _like_search(conn, query, project, obs_type, scope, limit):
     return [_row_to_dict(r) for r in rows]
 
 
-def tool_mem_get(conn: sqlite3.Connection, args: dict) -> dict:
+def tool_mem_get_observation(conn: sqlite3.Connection, args: dict) -> dict:
     obs_id = args.get("id")
     if obs_id is None:
         return {"error": "id is required"}
@@ -365,13 +445,18 @@ def tool_mem_update(conn: sqlite3.Connection, args: dict) -> dict:
 
     updates = []
     params = []
-    for field in ("title", "content", "type"):
+    for field in ("title", "content", "type", "topic_key", "scope", "project"):
         if field in args and args[field] is not None:
+            value = args[field]
+            if field == "topic_key":
+                value = _normalize_topic_key(value)
+            if field == "type":
+                value = _validate_type(value) or value
             updates.append(f"{field} = ?")
-            params.append(args[field])
+            params.append(value)
 
     if not updates:
-        return {"error": "nothing to update — provide at least one of: title, content, type"}
+        return {"error": "nothing to update — provide at least one of: title, content, type, topic_key, scope, project"}
 
     updates.append("updated_at = ?")
     params.append(_now())
@@ -383,21 +468,22 @@ def tool_mem_update(conn: sqlite3.Connection, args: dict) -> dict:
 
 def tool_mem_context(conn: sqlite3.Connection, args: dict) -> dict:
     project = args.get("project")
-    session_id = args.get("session_id")
+    scope = args.get("scope")
     limit = int(args.get("limit", 20))
 
-    if not project:
-        return {"error": "project is required"}
+    sql = "SELECT id, title, SUBSTR(content, 1, 200) as snippet, type, topic_key, scope, updated_at FROM observations"
+    conditions = []
+    params: list = []
 
-    sql = """
-        SELECT id, title, SUBSTR(content, 1, 200) as snippet, type, topic_key, scope, updated_at
-        FROM observations WHERE project = ?
-    """
-    params: list = [project]
+    if project:
+        conditions.append("project = ?")
+        params.append(project)
+    if scope:
+        conditions.append("scope = ?")
+        params.append(scope)
 
-    if session_id:
-        sql += " AND session_id = ?"
-        params.append(session_id)
+    if conditions:
+        sql += " WHERE " + " AND ".join(conditions)
 
     sql += " ORDER BY updated_at DESC LIMIT ?"
     params.append(limit)
@@ -407,37 +493,211 @@ def tool_mem_context(conn: sqlite3.Connection, args: dict) -> dict:
 
 
 def tool_mem_session_start(conn: sqlite3.Connection, args: dict) -> dict:
+    session_id = args.get("id")
     project = args.get("project")
-    goal = args.get("goal")
-    session_id = str(uuid.uuid4())
-    now = _now()
+    directory = args.get("directory")
 
+    if not session_id:
+        return {"error": "id is required"}
+    if not project:
+        return {"error": "project is required"}
+
+    now = _now()
     conn.execute(
-        "INSERT INTO sessions (id, project, goal, started_at) VALUES (?, ?, ?, ?)",
-        (session_id, project, goal, now),
+        "INSERT INTO sessions (id, project, directory, started_at) VALUES (?, ?, ?, ?)",
+        (session_id, project, directory, now),
     )
     return {"session_id": session_id, "started_at": now}
 
 
-def tool_mem_session_summary(conn: sqlite3.Connection, args: dict) -> dict:
-    session_id = args.get("session_id")
-    summary = args.get("summary", "").strip()
+def tool_mem_session_end(conn: sqlite3.Connection, args: dict) -> dict:
+    session_id = args.get("id")
+    summary = args.get("summary")
 
     if not session_id:
-        return {"error": "session_id is required"}
-    if not summary:
-        return {"error": "summary is required"}
+        return {"error": "id is required"}
 
-    now = _now()
     row = conn.execute("SELECT id FROM sessions WHERE id = ?", (session_id,)).fetchone()
     if not row:
         return {"error": f"session {session_id} not found"}
 
-    conn.execute(
-        "UPDATE sessions SET summary = ?, ended_at = ? WHERE id = ?",
-        (summary, now, session_id),
-    )
+    now = _now()
+    if summary:
+        conn.execute(
+            "UPDATE sessions SET summary = ?, ended_at = ? WHERE id = ?",
+            (summary, now, session_id),
+        )
+    else:
+        conn.execute(
+            "UPDATE sessions SET ended_at = ? WHERE id = ?",
+            (now, session_id),
+        )
     return {"session_id": session_id, "ended_at": now, "action": "closed"}
+
+
+def tool_mem_session_summary(conn: sqlite3.Connection, args: dict) -> dict:
+    content = args.get("content", "").strip()
+    project = args.get("project")
+    session_id = args.get("session_id")
+
+    if not content:
+        return {"error": "content is required"}
+    if not project:
+        return {"error": "project is required"}
+
+    # Default session_id if not provided
+    if not session_id:
+        session_id = f"manual-save-{project}"
+
+    now = _now()
+
+    # Save as a session_summary observation
+    cur = conn.execute(
+        """INSERT INTO observations (title, content, type, scope, topic_key, project, session_id, created_at, updated_at)
+           VALUES (?, ?, 'session_summary', 'project', ?, ?, ?, ?, ?)""",
+        ("Session summary", content, f"session-summary/{session_id}", project, session_id, now, now),
+    )
+
+    # Also update the session record if it exists
+    existing_session = conn.execute("SELECT id FROM sessions WHERE id = ?", (session_id,)).fetchone()
+    if existing_session:
+        conn.execute(
+            "UPDATE sessions SET summary = ?, ended_at = ? WHERE id = ?",
+            (content, now, session_id),
+        )
+
+    return {"id": cur.lastrowid, "session_id": session_id, "action": "saved"}
+
+
+def tool_mem_save_prompt(conn: sqlite3.Connection, args: dict) -> dict:
+    content = args.get("content", "").strip()
+    project = args.get("project")
+    session_id = args.get("session_id")
+
+    if not content:
+        return {"error": "content is required"}
+
+    if not session_id and project:
+        session_id = f"manual-save-{project}"
+
+    now = _now()
+    cur = conn.execute(
+        """INSERT INTO observations (title, content, type, scope, project, session_id, created_at, updated_at)
+           VALUES (?, ?, 'prompt', 'project', ?, ?, ?, ?)""",
+        ("User prompt", content, project, session_id, now, now),
+    )
+    return {"id": cur.lastrowid, "action": "created"}
+
+
+def tool_mem_capture_passive(conn: sqlite3.Connection, args: dict) -> dict:
+    content = args.get("content", "").strip()
+    project = args.get("project")
+    session_id = args.get("session_id")
+    source = args.get("source")
+
+    if not content:
+        return {"error": "content is required"}
+
+    if not session_id and project:
+        session_id = f"manual-save-{project}"
+
+    now = _now()
+
+    # Look for "## Key Learnings:" or "## Aprendizajes Clave:" sections
+    learnings_pattern = re.compile(
+        r"##\s*(?:Key Learnings|Aprendizajes Clave)\s*:?\s*\n(.*?)(?=\n##|\Z)",
+        re.DOTALL | re.IGNORECASE,
+    )
+    match = learnings_pattern.search(content)
+
+    saved = []
+    skipped = []
+
+    if match:
+        section = match.group(1)
+        # Extract numbered (1. ...) or bulleted (- ..., * ...) items
+        items = re.findall(r"(?:^|\n)\s*(?:\d+[.)]\s*|[-*]\s+)(.+)", section)
+        if not items:
+            items = [section.strip()]
+
+        for item in items:
+            item = item.strip()
+            if not item:
+                continue
+
+            title = item[:100] if len(item) > 100 else item
+
+            # Deduplicate: check if same title+project already exists
+            existing = conn.execute(
+                "SELECT id FROM observations WHERE title = ? AND project = ? AND type = 'learning'",
+                (title, project),
+            ).fetchone()
+            if existing:
+                skipped.append(title)
+                continue
+
+            cur = conn.execute(
+                """INSERT INTO observations (title, content, type, scope, project, session_id, created_at, updated_at)
+                   VALUES (?, ?, 'learning', 'project', ?, ?, ?, ?)""",
+                (title, item, project, session_id, now, now),
+            )
+            saved.append({"id": cur.lastrowid, "title": title})
+    else:
+        # No learnings section found — save the whole content as a single observation
+        title = content[:100] if len(content) > 100 else content
+        title_oneline = title.split("\n")[0]
+
+        existing = conn.execute(
+            "SELECT id FROM observations WHERE title = ? AND project = ? AND type = 'learning'",
+            (title_oneline, project),
+        ).fetchone()
+        if existing:
+            skipped.append(title_oneline)
+        else:
+            cur = conn.execute(
+                """INSERT INTO observations (title, content, type, scope, project, session_id, created_at, updated_at)
+                   VALUES (?, ?, 'learning', 'project', ?, ?, ?, ?)""",
+                (title_oneline, content, project, session_id, now, now),
+            )
+            saved.append({"id": cur.lastrowid, "title": title_oneline})
+
+    return {
+        "saved": saved,
+        "skipped": skipped,
+        "source": source,
+        "count_saved": len(saved),
+        "count_skipped": len(skipped),
+    }
+
+
+def tool_mem_suggest_topic_key(conn: sqlite3.Connection, args: dict) -> dict:
+    title = args.get("title", "").strip()
+    content = args.get("content", "").strip()
+    obs_type = args.get("type", "").strip()
+
+    # Take title (preferred) or first 50 chars of content
+    base = title if title else content[:50]
+    if not base:
+        return {"topic_key": "misc/untitled"}
+
+    # Normalize: lowercase, replace spaces with hyphens, remove special chars
+    key = base.lower().strip()
+    key = key.replace(" ", "-")
+    key = re.sub(r"[^a-z0-9/_-]", "", key)
+    key = re.sub(r"-+", "-", key).strip("-")
+
+    # Truncate to reasonable length
+    if len(key) > 60:
+        key = key[:60].rstrip("-")
+
+    # Prepend type/ if type is provided
+    if obs_type:
+        obs_type_normalized = obs_type.lower().strip()
+        # Don't double-prefix if key already starts with the type
+        if not key.startswith(f"{obs_type_normalized}/"):
+            key = f"{obs_type_normalized}/{key}"
+
+    return {"topic_key": key}
 
 
 # ---------------------------------------------------------------------------
@@ -447,62 +707,78 @@ def tool_mem_session_summary(conn: sqlite3.Connection, args: dict) -> dict:
 TOOL_HANDLERS = {
     "mem_save": tool_mem_save,
     "mem_search": tool_mem_search,
-    "mem_get": tool_mem_get,
+    "mem_get_observation": tool_mem_get_observation,
     "mem_update": tool_mem_update,
     "mem_context": tool_mem_context,
     "mem_session_start": tool_mem_session_start,
+    "mem_session_end": tool_mem_session_end,
     "mem_session_summary": tool_mem_session_summary,
+    "mem_save_prompt": tool_mem_save_prompt,
+    "mem_capture_passive": tool_mem_capture_passive,
+    "mem_suggest_topic_key": tool_mem_suggest_topic_key,
 }
 
 TOOLS_SCHEMA = [
     {
         "name": "mem_save",
-        "description": "Save an observation to persistent memory. If topic_key is provided and already exists for the same project, the existing observation is updated (upsert).",
+        "description": (
+            "Save an important observation to persistent memory. Call this PROACTIVELY after completing significant work — don't wait to be asked.\n\n"
+            "WHEN to save (call this after each of these):\n"
+            "- Architectural decisions or tradeoffs\n"
+            "- Bug fixes (what was wrong, why, how you fixed it)\n"
+            "- New patterns or conventions established\n"
+            "- Configuration changes or environment setup\n"
+            "- Important discoveries or gotchas\n"
+            "- File structure changes\n\n"
+            "FORMAT for content — use this structured format:\n"
+            "  **What**: [concise description of what was done]\n"
+            "  **Why**: [the reasoning, user request, or problem that drove it]\n"
+            "  **Where**: [files/paths affected]\n"
+            "  **Learned**: [any gotchas, edge cases, or decisions made — omit if none]\n\n"
+            "TITLE should be short and searchable. If topic_key is provided and already exists for the same project, the existing observation is updated (upsert)."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "title": {"type": "string", "description": "Short searchable title (verb + what)"},
-                "content": {"type": "string", "description": "Full observation content"},
+                "title": {"type": "string", "description": "Short, searchable title (e.g. 'JWT auth middleware', 'Fixed N+1 query')"},
+                "content": {"type": "string", "description": "Structured content using **What**, **Why**, **Where**, **Learned** format"},
                 "type": {
                     "type": "string",
-                    "enum": ["bugfix", "decision", "architecture", "discovery", "pattern", "config", "preference", "convention", "session_summary"],
-                    "description": "Observation category",
+                    "description": "Category: decision, architecture, bugfix, pattern, config, discovery, learning (default: manual)",
                 },
                 "scope": {
                     "type": "string",
-                    "enum": ["project", "personal"],
-                    "default": "project",
-                    "description": "project (default) or personal",
+                    "description": "Scope for this observation: project (default) or personal",
                 },
-                "topic_key": {"type": "string", "description": "Stable key for upsert (e.g. architecture/auth-model)"},
-                "project": {"type": "string", "description": "Project identifier"},
-                "session_id": {"type": "string", "description": "Current session UUID"},
+                "topic_key": {"type": "string", "description": "Optional topic identifier for upserts (e.g. architecture/auth-model). Reuses and updates the latest observation in same project+scope."},
+                "project": {"type": "string", "description": "Project name"},
+                "session_id": {"type": "string", "description": "Session ID to associate with (default: manual-save-{project})"},
             },
             "required": ["title", "content"],
         },
     },
     {
         "name": "mem_search",
-        "description": "Full-text search across observations. Uses FTS5 when available, falls back to LIKE.",
+        "description": "Search your persistent memory across all sessions. Uses FTS5 when available, falls back to LIKE. Use this to find past decisions, bugs fixed, patterns used, files changed, or any context from previous coding sessions.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "Search query text"},
-                "project": {"type": "string", "description": "Filter by project"},
-                "type": {"type": "string", "description": "Filter by observation type"},
-                "scope": {"type": "string", "enum": ["project", "personal"], "description": "Filter by scope"},
-                "limit": {"type": "integer", "default": 10, "description": "Max results (default 10)"},
+                "query": {"type": "string", "description": "Search query — natural language or keywords"},
+                "project": {"type": "string", "description": "Filter by project name"},
+                "type": {"type": "string", "description": "Filter by type: tool_use, file_change, command, file_read, search, manual, decision, architecture, bugfix, pattern"},
+                "scope": {"type": "string", "description": "Filter by scope: project (default) or personal"},
+                "limit": {"type": "number", "default": 10, "description": "Max results (default: 10, max: 20)"},
             },
             "required": ["query"],
         },
     },
     {
-        "name": "mem_get",
-        "description": "Get a full observation by ID without truncation.",
+        "name": "mem_get_observation",
+        "description": "Get the full content of a specific observation by ID. Use when you need the complete, untruncated content of an observation found via mem_search or mem_timeline.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "id": {"type": "integer", "description": "Observation ID"},
+                "id": {"type": "number", "description": "The observation ID to retrieve"},
             },
             "required": ["id"],
         },
@@ -513,53 +789,120 @@ TOOLS_SCHEMA = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "id": {"type": "integer", "description": "Observation ID to update"},
-                "title": {"type": "string", "description": "New title (optional)"},
-                "content": {"type": "string", "description": "New content (optional)"},
-                "type": {
-                    "type": "string",
-                    "enum": ["bugfix", "decision", "architecture", "discovery", "pattern", "config", "preference", "convention", "session_summary"],
-                    "description": "New type (optional)",
-                },
+                "id": {"type": "number", "description": "Observation ID to update"},
+                "title": {"type": "string", "description": "New title"},
+                "content": {"type": "string", "description": "New content"},
+                "type": {"type": "string", "description": "New type/category"},
+                "topic_key": {"type": "string", "description": "New topic key (normalized internally)"},
+                "scope": {"type": "string", "description": "New scope: project or personal"},
+                "project": {"type": "string", "description": "New project value"},
             },
             "required": ["id"],
         },
     },
     {
         "name": "mem_context",
-        "description": "Get recent observations for a project/session, ordered by most recently updated.",
+        "description": "Get recent memory context from previous sessions. Shows recent sessions and observations to understand what was done before.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "project": {"type": "string", "description": "Project identifier"},
-                "session_id": {"type": "string", "description": "Filter by session (optional)"},
-                "limit": {"type": "integer", "default": 20, "description": "Max results (default 20)"},
+                "project": {"type": "string", "description": "Filter by project (omit for all projects)"},
+                "scope": {"type": "string", "description": "Filter observations by scope: project (default) or personal"},
+                "limit": {"type": "number", "default": 20, "description": "Number of observations to retrieve (default: 20)"},
             },
-            "required": ["project"],
+            "required": [],
         },
     },
     {
         "name": "mem_session_start",
-        "description": "Register a new working session. Returns a UUID session_id.",
+        "description": "Register the start of a new coding session. Call this at the beginning of a session to track activity.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "project": {"type": "string", "description": "Project identifier"},
-                "goal": {"type": "string", "description": "Session goal (optional)"},
+                "id": {"type": "string", "description": "Unique session identifier"},
+                "project": {"type": "string", "description": "Project name"},
+                "directory": {"type": "string", "description": "Working directory"},
             },
-            "required": ["project"],
+            "required": ["id", "project"],
+        },
+    },
+    {
+        "name": "mem_session_end",
+        "description": "Mark a coding session as completed with an optional summary.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "Session identifier to close"},
+                "summary": {"type": "string", "description": "Summary of what was accomplished"},
+            },
+            "required": ["id"],
         },
     },
     {
         "name": "mem_session_summary",
-        "description": "Save a session summary and mark the session as ended.",
+        "description": (
+            "Save a comprehensive end-of-session summary. Call this when a session is ending or when significant work is complete. "
+            "This creates a structured summary that future sessions will use to understand what happened.\n\n"
+            "FORMAT — use this exact structure in the content field:\n\n"
+            "## Goal\n[One sentence: what were we building/working on in this session]\n\n"
+            "## Instructions\n[User preferences, constraints, or context discovered during this session.]\n\n"
+            "## Discoveries\n- [Technical finding, gotcha, or learning 1]\n\n"
+            "## Accomplished\n- [Completed task 1 — with key implementation details]\n\n"
+            "## Relevant Files\n- path/to/file.ts — [what it does or what changed]"
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "session_id": {"type": "string", "description": "Session UUID to close"},
-                "summary": {"type": "string", "description": "Session summary content"},
+                "content": {"type": "string", "description": "Full session summary using the Goal/Instructions/Discoveries/Accomplished/Files format"},
+                "project": {"type": "string", "description": "Project name"},
+                "session_id": {"type": "string", "description": "Session ID (default: manual-save-{project})"},
             },
-            "required": ["session_id", "summary"],
+            "required": ["content", "project"],
+        },
+    },
+    {
+        "name": "mem_save_prompt",
+        "description": "Save a user prompt to persistent memory. Use this to record what the user asked — their intent, questions, and requests — so future sessions have context about the user's goals.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "content": {"type": "string", "description": "The user's prompt text"},
+                "project": {"type": "string", "description": "Project name"},
+                "session_id": {"type": "string", "description": "Session ID to associate with (default: manual-save-{project})"},
+            },
+            "required": ["content"],
+        },
+    },
+    {
+        "name": "mem_capture_passive",
+        "description": (
+            "Extract and save structured learnings from text output. Use this at the end of a task to capture knowledge automatically.\n\n"
+            "The tool looks for sections like \"## Key Learnings:\" or \"## Aprendizajes Clave:\" and extracts numbered or bulleted items. "
+            "Each item is saved as a separate observation.\n\n"
+            "Duplicates are automatically detected and skipped — safe to call multiple times with the same content."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "content": {"type": "string", "description": "The text output containing a '## Key Learnings:' section with numbered or bulleted items"},
+                "project": {"type": "string", "description": "Project name"},
+                "session_id": {"type": "string", "description": "Session ID (default: manual-save-{project})"},
+                "source": {"type": "string", "description": "Source identifier (e.g. 'subagent-stop', 'session-end')"},
+            },
+            "required": ["content"],
+        },
+    },
+    {
+        "name": "mem_suggest_topic_key",
+        "description": "Suggest a stable topic_key for memory upserts. Use this before mem_save when you want evolving topics (like architecture decisions) to update a single observation over time.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Observation title (preferred input for stable keys)"},
+                "content": {"type": "string", "description": "Observation content used as fallback if title is empty"},
+                "type": {"type": "string", "description": "Observation type/category, e.g. architecture, decision, bugfix"},
+            },
+            "required": [],
         },
     },
 ]
@@ -605,7 +948,7 @@ def main():
         if method == "initialize":
             _send(_ok(rid, {
                 "protocolVersion": "2024-11-05",
-                "serverInfo": {"name": "gentleman-memory", "version": "2.0.0"},
+                "serverInfo": {"name": "gentleman-memory", "version": "3.0.0"},
                 "capabilities": {"tools": {}},
             }))
             continue
