@@ -24,6 +24,12 @@ Ademas incluye **memoria persistente** (SQLite + FTS5 via Engram, y archivos loc
 curl -sSL https://raw.githubusercontent.com/JuaniSarmiento/Ecosistema-Claude/main/setup.sh | bash
 ```
 
+### Windows (PowerShell)
+
+```powershell
+irm https://raw.githubusercontent.com/JuaniSarmiento/Ecosistema-Claude/main/setup.ps1 | iex
+```
+
 Despues abri Claude y corre `/reload-plugins`. Listo.
 
 ### Manual (paso a paso)
