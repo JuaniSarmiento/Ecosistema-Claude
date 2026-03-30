@@ -82,16 +82,16 @@ else:
 changed = False
 
 # Add marketplace
-marketplaces = data.setdefault('extraKnownMarketplaces', [])
+marketplaces = data.setdefault('extraKnownMarketplaces', {})
 if 'ecosistema-claude' not in marketplaces:
-    marketplaces.append('ecosistema-claude')
+    marketplaces['ecosistema-claude'] = {'source': {'source': 'github', 'repo': 'JuaniSarmiento/Ecosistema-Claude'}}
     changed = True
 
 # Enable plugin
-plugins = data.setdefault('enabledPlugins', [])
+plugins = data.setdefault('enabledPlugins', {})
 entry = 'claude-gentleman-native@ecosistema-claude'
 if entry not in plugins:
-    plugins.append(entry)
+    plugins[entry] = True
     changed = True
 
 # Write back
@@ -109,8 +109,8 @@ SETTINGS_RESULT=$(python3 -c "
 import json, os
 path = os.path.expanduser('~/.claude/settings.json')
 data = json.load(open(path))
-mp = 'ecosistema-claude' in data.get('extraKnownMarketplaces', [])
-pl = 'claude-gentleman-native@ecosistema-claude' in data.get('enabledPlugins', [])
+mp = 'ecosistema-claude' in data.get('extraKnownMarketplaces', {})
+pl = 'claude-gentleman-native@ecosistema-claude' in data.get('enabledPlugins', {})
 print('ok' if mp and pl else 'fail')
 ")
 
