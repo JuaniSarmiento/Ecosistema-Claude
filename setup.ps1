@@ -16,38 +16,23 @@ function Stop-Setup  { param([string]$Msg) Write-Fail $Msg; exit 1 }
 # ── Resolve Python command ──────────────────────────────────────────────────
 
 $PythonCmd = $null
-
-try {
-    $null = & python3 --version 2>&1
-    $PythonCmd = "python3"
-} catch {}
-
+try { $null = & python3 --version 2>&1; $PythonCmd = "python3" } catch {}
 if (-not $PythonCmd) {
-    try {
-        $null = & python --version 2>&1
-        $PythonCmd = "python"
-    } catch {}
+    try { $null = & python --version 2>&1; $PythonCmd = "python" } catch {}
 }
 
 # ── Step 1: Check dependencies ──────────────────────────────────────────────
 
 Write-Info "Checking dependencies..."
 
-try {
-    $claudeVersion = & claude --version 2>&1
-    Write-Ok "claude found"
-} catch {
-    Stop-Setup "claude CLI not found. Install: https://docs.anthropic.com/en/docs/claude-code"
-}
+try { $null = & claude --version 2>&1; Write-Ok "claude found" }
+catch { Stop-Setup "claude CLI not found. Install: https://docs.anthropic.com/en/docs/claude-code" }
 
-if (-not $PythonCmd) {
-    Stop-Setup "python not found. Install Python 3.10+ from https://python.org"
-}
+if (-not $PythonCmd) { Stop-Setup "python not found. Install Python 3.10+ from https://python.org" }
 
 $pyVersion = & $PythonCmd --version 2>&1
 Write-Ok "$PythonCmd found ($pyVersion)"
 
-# Check FTS5 support
 $fts5Script = @"
 import sqlite3, tempfile, os
 db = os.path.join(tempfile.mkdtemp(), 'test.db')
@@ -61,244 +46,107 @@ finally:
     conn.close()
     os.unlink(db)
 "@
+try { $fts5Result = & $PythonCmd -c $fts5Script 2>&1 } catch { $fts5Result = "no" }
+if ($fts5Result -eq "yes") { Write-Ok "SQLite FTS5 support available" }
+else { Write-Warn "FTS5 not available. Search will use LIKE fallback." }
 
-try {
-    $fts5Result = & $PythonCmd -c $fts5Script 2>&1
-} catch {
-    $fts5Result = "no"
-}
+# ── Step 2: Configure marketplace via Python ─────────────────────────────────
 
-if ($fts5Result -eq "yes") {
-    Write-Ok "SQLite FTS5 support available"
-} else {
-    Write-Warn "SQLite FTS5 not available. Memory search will use LIKE fallback (slower but functional)."
-}
+Write-Info "Configuring marketplace and plugin..."
 
-# ── Step 2: Add marketplace to settings.json ─────────────────────────────────
-
-$settingsDir = Join-Path $env:USERPROFILE ".claude"
-$settingsFile = Join-Path $settingsDir "settings.json"
-
-Write-Info "Configuring marketplace in $settingsFile..."
-
-if (-not (Test-Path $settingsDir)) {
-    New-Item -ItemType Directory -Path $settingsDir -Force | Out-Null
-}
-
-$settingsScript = @"
+$setupAllScript = @"
 import json, os, sys
 
-path = os.path.join(os.environ['USERPROFILE'], '.claude', 'settings.json')
+home = os.environ.get('USERPROFILE', os.path.expanduser('~'))
 
-if os.path.exists(path):
-    with open(path, 'r') as f:
-        data = json.load(f)
+# --- settings.json ---
+settings_dir = os.path.join(home, '.claude')
+os.makedirs(settings_dir, exist_ok=True)
+settings_path = os.path.join(settings_dir, 'settings.json')
+
+if os.path.exists(settings_path):
+    with open(settings_path) as f:
+        settings = json.load(f)
 else:
-    data = {}
+    settings = {}
 
-changed = False
+mp = settings.setdefault('extraKnownMarketplaces', {})
+if 'ecosistema-claude' not in mp:
+    mp['ecosistema-claude'] = {'source': {'source': 'github', 'repo': 'JuaniSarmiento/Ecosistema-Claude'}}
 
-marketplaces = data.setdefault('extraKnownMarketplaces', {})
-if 'ecosistema-claude' not in marketplaces:
-    marketplaces['ecosistema-claude'] = {'source': {'source': 'github', 'repo': 'JuaniSarmiento/Ecosistema-Claude'}}
-    changed = True
+pl = settings.setdefault('enabledPlugins', {})
+pl['claude-gentleman-native@ecosistema-claude'] = True
 
-plugins = data.setdefault('enabledPlugins', {})
-entry = 'claude-gentleman-native@ecosistema-claude'
-if entry not in plugins:
-    plugins[entry] = True
-    changed = True
+with open(settings_path, 'w') as f:
+    json.dump(settings, f, indent=2)
 
-with open(path, 'w') as f:
-    json.dump(data, f, indent=2)
-    f.write('\n')
+print('settings_ok')
 
-if changed:
-    print('updated')
-else:
-    print('already_configured')
-"@
+# --- memory dir ---
+mem_dir = os.path.join(home, '.claude', 'gentleman-memory')
+os.makedirs(mem_dir, exist_ok=True)
+print('memdir_ok')
 
-& $PythonCmd -c $settingsScript
-
-# Verify settings
-$verifySettingsScript = @"
-import json, os
-path = os.path.join(os.environ['USERPROFILE'], '.claude', 'settings.json')
-data = json.load(open(path))
-mp = 'ecosistema-claude' in data.get('extraKnownMarketplaces', {})
-pl = 'claude-gentleman-native@ecosistema-claude' in data.get('enabledPlugins', {})
-print('ok' if mp and pl else 'fail')
-"@
-
-$settingsResult = & $PythonCmd -c $verifySettingsScript
-
-if ($settingsResult -eq "ok") {
-    Write-Ok "Marketplace registered and plugin enabled"
-} else {
-    Stop-Setup "Failed to update settings.json"
-}
-
-# ── Step 3: Force marketplace download ───────────────────────────────────────
-
-Write-Info "Attempting to download marketplace plugin..."
-
-$pluginDownloaded = $false
-
-try {
-    $null = & claude plugins update ecosistema-claude 2>&1
-    Write-Ok "Plugin downloaded via 'claude plugins update'"
-    $pluginDownloaded = $true
-} catch {}
-
-if (-not $pluginDownloaded) {
-    try {
-        $null = & claude plugin update 2>&1
-        Write-Ok "Plugin downloaded via 'claude plugin update'"
-        $pluginDownloaded = $true
-    } catch {}
-}
-
-if (-not $pluginDownloaded) {
-    Write-Warn "Could not force plugin download. Claude will download it on next start."
-}
-
-# ── Step 4: Create memory database directory ─────────────────────────────────
-
-$memoryDir = Join-Path (Join-Path $env:USERPROFILE ".claude") "gentleman-memory"
-
-Write-Info "Creating memory directory..."
-
-if (-not (Test-Path $memoryDir)) {
-    New-Item -ItemType Directory -Path $memoryDir -Force | Out-Null
-}
-
-Write-Ok "Memory directory ready: $memoryDir"
-
-# ── Step 5: Resolve server path & add MCP server to .claude.json ─────────────
-
-Write-Info "Locating memory server..."
-
-$marketplacePath = Join-Path (Join-Path (Join-Path (Join-Path (Join-Path (Join-Path (Join-Path $env:USERPROFILE ".claude") "plugins") "marketplaces") "ecosistema-claude") "plugin") "servers") "project_memory_server.py"
-
-# Try to resolve local path (if running from cloned repo)
-$localPath = $null
-try {
-    $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-    if ($scriptDir) {
-        $localPath = Join-Path (Join-Path (Join-Path $scriptDir "plugin") "servers") "project_memory_server.py"
-    }
-} catch {}
-
-$serverPath = $null
-
-if (Test-Path $marketplacePath) {
-    $serverPath = $marketplacePath
-    Write-Ok "Server found (marketplace install): $serverPath"
-} elseif ($localPath -and (Test-Path $localPath)) {
-    $serverPath = $localPath
-    Write-Ok "Server found (local repo): $serverPath"
-} else {
-    $serverPath = $marketplacePath
-    Write-Warn "Server not found yet. Using expected marketplace path: $serverPath"
-    Write-Warn "The server will be available after Claude downloads the plugin on next start."
-}
-
-Write-Info "Configuring MCP server in ~/.claude.json..."
-
-# Use forward slashes in the JSON path (Python handles both on Windows)
-$serverPathForJson = $serverPath -replace '\\', '/'
-
-$claudeJsonScript = @"
-import json, os, sys
-
-path = os.path.join(os.environ['USERPROFILE'], '.claude.json')
-server_path = sys.argv[1]
-
-if os.path.exists(path):
-    with open(path, 'r') as f:
+# --- .claude.json (MCP server) ---
+claude_json_path = os.path.join(home, '.claude.json')
+if os.path.exists(claude_json_path):
+    with open(claude_json_path) as f:
         content = f.read().strip()
-    data = json.loads(content) if content else {}
+    claude_data = json.loads(content) if content else {}
 else:
-    data = {}
+    claude_data = {}
 
-servers = data.setdefault('mcpServers', {})
+servers = claude_data.setdefault('mcpServers', {})
+server_py = os.path.join(home, '.claude', 'plugins', 'marketplaces', 'ecosistema-claude', 'plugin', 'servers', 'project_memory_server.py')
+server_py_fwd = server_py.replace('\\\\', '/')
 
 if 'gentleman-memory' not in servers:
     servers['gentleman-memory'] = {
         'type': 'stdio',
         'command': 'python',
-        'args': [server_path],
+        'args': [server_py_fwd],
         'env': {}
     }
-    status = 'added'
+elif servers['gentleman-memory'].get('args', [''])[0] != server_py_fwd:
+    servers['gentleman-memory']['args'] = [server_py_fwd]
+
+with open(claude_json_path, 'w') as f:
+    json.dump(claude_data, f, indent=2)
+
+print('mcp_ok')
+
+# --- Init DB if server exists ---
+if os.path.exists(server_py):
+    import subprocess
+    r = subprocess.run([sys.executable, server_py, '--init'], capture_output=True, text=True)
+    print('db_ok' if r.returncode == 0 else 'db_skip')
 else:
-    existing_args = servers['gentleman-memory'].get('args', [])
-    if not existing_args or existing_args[0] != server_path:
-        servers['gentleman-memory']['args'] = [server_path]
-        status = 'updated'
-    else:
-        status = 'already_configured'
-
-with open(path, 'w') as f:
-    json.dump(data, f, indent=2)
-    f.write('\n')
-
-print(status)
+    print('db_skip')
 "@
 
-& $PythonCmd -c $claudeJsonScript $serverPathForJson
+$results = & $PythonCmd -c $setupAllScript 2>&1
 
-# Verify MCP config
-$verifyMcpScript = @"
-import json, os
-path = os.path.join(os.environ['USERPROFILE'], '.claude.json')
-if not os.path.exists(path):
-    print('fail')
-else:
-    data = json.load(open(path))
-    has_server = 'gentleman-memory' in data.get('mcpServers', {})
-    print('ok' if has_server else 'fail')
-"@
+$resultText = $results -join " "
 
-$mcpResult = & $PythonCmd -c $verifyMcpScript
+if ($resultText -match "settings_ok") { Write-Ok "Marketplace registered and plugin enabled" }
+else { Stop-Setup "Failed to configure marketplace" }
 
-if ($mcpResult -eq "ok") {
-    Write-Ok "MCP server configured in ~/.claude.json"
-} else {
-    Stop-Setup "Failed to configure MCP server in ~/.claude.json"
-}
+if ($resultText -match "memdir_ok") { Write-Ok "Memory directory ready" }
 
-# ── Step 6: Initialize the database ─────────────────────────────────────────
+if ($resultText -match "mcp_ok") { Write-Ok "MCP server configured in ~/.claude.json" }
+else { Stop-Setup "Failed to configure MCP server" }
 
-Write-Info "Initializing memory database..."
+if ($resultText -match "db_ok") { Write-Ok "Database initialized" }
+else { Write-Warn "Server not downloaded yet. DB will init on first use." }
 
-if (Test-Path $serverPath) {
-    try {
-        $initOutput = & $PythonCmd $serverPath --init 2>&1
-        Write-Ok "$initOutput"
-    } catch {
-        Write-Warn "Failed to initialize database: $_"
-    }
-} else {
-    Write-Warn "Server script not available yet. Database will be initialized on first use."
-}
-
-# ── Step 7: Success ─────────────────────────────────────────────────────────
+# ── Success ─────────────────────────────────────────────────────────────────
 
 Write-Host ""
 Write-Host "+--------------------------------------------------+" -ForegroundColor Green
 Write-Host "|   Gentleman Native -- Setup Complete              |" -ForegroundColor Green
 Write-Host "+--------------------------------------------------+" -ForegroundColor Green
 Write-Host "|                                                   |" -ForegroundColor Green
-Write-Host "|  + Marketplace registered                         |" -ForegroundColor Green
-Write-Host "|  + Plugin enabled                                 |" -ForegroundColor Green
-Write-Host "|  + Memory server configured                       |" -ForegroundColor Green
-Write-Host "|  + Database initialized                           |" -ForegroundColor Green
-Write-Host "|                                                   |" -ForegroundColor Green
 Write-Host "|  Next: Open Claude and run /reload-plugins        |" -ForegroundColor Green
 Write-Host "|                                                   |" -ForegroundColor Green
 Write-Host "+--------------------------------------------------+" -ForegroundColor Green
 Write-Host ""
-
-Write-Info "If this is your first time, you may need to restart Claude for changes to take effect."
