@@ -165,7 +165,7 @@ if (-not $pluginDownloaded) {
 
 # ── Step 4: Create memory database directory ─────────────────────────────────
 
-$memoryDir = Join-Path $env:USERPROFILE ".claude" "gentleman-memory"
+$memoryDir = Join-Path (Join-Path $env:USERPROFILE ".claude") "gentleman-memory"
 
 Write-Info "Creating memory directory..."
 
@@ -179,14 +179,14 @@ Write-Ok "Memory directory ready: $memoryDir"
 
 Write-Info "Locating memory server..."
 
-$marketplacePath = Join-Path $env:USERPROFILE ".claude" "plugins" "marketplaces" "ecosistema-claude" "plugin" "servers" "project_memory_server.py"
+$marketplacePath = Join-Path (Join-Path (Join-Path (Join-Path (Join-Path (Join-Path (Join-Path $env:USERPROFILE ".claude") "plugins") "marketplaces") "ecosistema-claude") "plugin") "servers") "project_memory_server.py"
 
 # Try to resolve local path (if running from cloned repo)
 $localPath = $null
 try {
     $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
     if ($scriptDir) {
-        $localPath = Join-Path $scriptDir "plugin" "servers" "project_memory_server.py"
+        $localPath = Join-Path (Join-Path (Join-Path $scriptDir "plugin") "servers") "project_memory_server.py"
     }
 } catch {}
 
