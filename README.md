@@ -18,26 +18,35 @@ Ademas incluye **memoria persistente** (SQLite + FTS5 via Engram, y archivos loc
 - Python 3.10+
 - jq
 
-### Instalar (una sola vez, para siempre)
+### Un solo comando (recomendado)
 
-1. Abri Claude Code:
+```bash
+curl -sSL https://raw.githubusercontent.com/JuaniSarmiento/Ecosistema-Claude/main/setup.sh | bash
+```
+
+Despues abri Claude y corre `/reload-plugins`. Listo.
+
+### Manual (paso a paso)
+
+1. Abri Claude Code → `/plugins` → Marketplaces → Add: `JuaniSarmiento/Ecosistema-Claude`
+2. Discover → instalar `claude-gentleman-native`
+3. Corre en tu terminal:
    ```bash
-   claude
+   # Agregar el servidor de memoria
+   python3 -c "
+   import json, os
+   p = os.path.expanduser('~/.claude.json')
+   d = json.load(open(p)) if os.path.exists(p) else {}
+   d.setdefault('mcpServers', {})['gentleman-memory'] = {
+       'type': 'stdio',
+       'command': 'python3',
+       'args': [os.path.expanduser('~/.claude/plugins/marketplaces/ecosistema-claude/plugin/servers/project_memory_server.py')],
+       'env': {}
+   }
+   json.dump(d, open(p, 'w'), indent=2)
+   "
    ```
-
-2. Adentro, abri el panel de plugins:
-   ```
-   /plugins
-   ```
-
-3. Anda a **Marketplaces** → **Add Marketplace** y pone:
-   ```
-   JuaniSarmiento/Ecosistema-Claude
-   ```
-
-4. Volve a **Discover**, busca `claude-gentleman-native` y dale instalar.
-
-5. Cerra Claude y abrilo de nuevo. Listo.
+4. Reinicia Claude
 
 ### Verificar instalacion
 
