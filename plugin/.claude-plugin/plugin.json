@@ -7,15 +7,21 @@
   },
   "userConfig": {
     "test_command": {
+      "title": "Test Command",
       "description": "Command used to run the main project verification suite",
+      "type": "string",
       "sensitive": false
     },
     "lint_command": {
+      "title": "Lint Command",
       "description": "Command used to run linting",
+      "type": "string",
       "sensitive": false
     },
     "docs_glob": {
+      "title": "Docs Glob",
       "description": "Glob for project docs and specs that should be indexed by the local MCP server",
+      "type": "string",
       "sensitive": false
     }
   }
