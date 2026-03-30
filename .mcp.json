@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "gentleman-memory": {
+      "command": "python3",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/servers/project_memory_server.py"
+      ],
+      "env": {
+        "DOCS_GLOB": "${user_config.docs_glob}",
+        "PROJECT_NAME": "${project.name}"
+      }
+    }
+  }
+}

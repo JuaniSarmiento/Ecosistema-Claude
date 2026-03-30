@@ -1,0 +1,16 @@
+# WSL metadata
+*:Zone.Identifier
+
+# Build artifacts
+dist/
+
+# SQLite databases
+*.db
+*.db-wal
+*.db-shm
+
+# Python cache
+__pycache__/
+
+# macOS metadata
+.DS_Store

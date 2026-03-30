@@ -1,0 +1,66 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/protect-files.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Bash(git *)",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/check-git-policy.sh"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/memory-inject.sh"
+          },
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/memory-snapshot.sh"
+          }
+        ]
+      }
+    ],
+    "ConfigChange": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/audit-config.sh"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/stop-verify.sh"
+          },
+          {
+            "type": "agent",
+            "prompt": "Verify that the task is actually ready to close. Read the diff, run lint and tests using the configured commands when available, and compare the result against the acceptance criteria. If the task is not ready, respond with JSON: {\"ok\": false, \"reason\": \"...\"}. If it is ready, respond with JSON: {\"ok\": true}.",
+            "timeout": 180
+          }
+        ]
+      }
+    ]
+  }
+}
