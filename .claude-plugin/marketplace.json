@@ -17,7 +17,7 @@
       "source": {
         "source": "git-subdir",
         "url": "https://github.com/JuaniSarmiento/Ecosistema-Claude.git",
-        "path": "."
+        "path": "plugin"
       },
       "category": "development",
       "homepage": "https://github.com/JuaniSarmiento/Ecosistema-Claude"
