@@ -10,7 +10,7 @@
     {
       "name": "claude-gentleman-native",
       "description": "Full development ecosystem with 8 specialized agents, SDD methodology, persistent SQLite memory with FTS5, security hooks, and 15 coding skills.",
-      "version": "1.0.0",
+      "version": "1.2.0",
       "author": {
         "name": "Juani Sarmiento"
       },

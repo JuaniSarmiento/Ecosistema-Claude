@@ -26,8 +26,8 @@ if rows:
     for title, content, obs_type, updated in rows:
         print(f'## {title} [{obs_type}] ({updated})')
         # Truncate long content
-        if len(content) > 500:
-            print(content[:500] + '...(truncated)')
+        if len(content) > 1000:
+            print(content[:1000] + '...(truncated)')
         else:
             print(content)
         print()

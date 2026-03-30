@@ -1,7 +1,7 @@
 {
   "name": "claude-gentleman-native",
   "description": "Claude-only development ecosystem with SDD, mentor orchestration, project memory, secure hooks and local MCP support.",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "author": {
     "name": "Juani Sarmiento"
   },
